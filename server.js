@@ -48,6 +48,9 @@ const pool = mysql.createPool({
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || 'password',
     database: process.env.DB_NAME || 'campus_connect',
+    port: Number(process.env.DB_PORT) || 3306,
+    // Hosted MySQL providers (TiDB, Aiven, etc.) require SSL: set DB_SSL=true
+    ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
@@ -1141,7 +1144,7 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
     console.log(`\n🚀 Campus Connect Backend Running`);
     console.log(`📍 Server: http://localhost:${PORT}`);
-    console.log(`🗄️  Database: campus_connect`);
+    console.log(`🗄️  Database: ${process.env.DB_NAME || 'campus_connect'}`);
     console.log(`🔐 Authentication: JWT`);
     console.log(`✅ Health Check: GET /health\n`);
 });
