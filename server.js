@@ -943,7 +943,12 @@ app.post('/conversations/:id/messages', authenticateToken, rateLimit(120, 15 * 6
 app.get('/health', asyncHandler(async (req, res) => {
     const { error } = await publicClient.from('profiles').select('id', { head: true, count: 'exact' });
     if (error) return res.status(503).json({ status: 'Database unavailable', error: error.message });
-    res.json({ status: 'Backend healthy', database: 'Supabase/PostgreSQL', authentication: 'Supabase Auth', timestamp: new Date().toISOString() });
+    // Reports whether the messaging migration has been applied (helps diagnose "relation does not exist" errors).
+    const { error: msgErr } = await adminClient.from('conversations').select('conversation_id', { head: true, count: 'exact' });
+    const { error: enumErr } = await adminClient.from('notifications').select('related_conversation_id', { head: true, count: 'exact' });
+    res.json({ status: 'Backend healthy', version: '2.1', database: 'Supabase/PostgreSQL', authentication: 'Supabase Auth',
+        messaging_tables: msgErr ? `MISSING - run supabase/migrations/20261007170000_messaging.sql (${msgErr.message})` : 'ok',
+        notifications_link_column: enumErr ? `MISSING (${enumErr.message})` : 'ok', timestamp: new Date().toISOString() });
 }));
 
 app.use((req, res) => res.status(404).json({ error: 'Endpoint not found' }));
