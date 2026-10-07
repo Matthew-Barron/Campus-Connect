@@ -612,8 +612,24 @@ async function loadMine() {
 }
 
 // ===== EDIT FORMS =====
-function openEditForm(kind, id) {
-    const r = store.get(id); if (!r) return toast('Reload the page and try again', 'error');
+// Finds the record to edit: first in the cache, otherwise fetched fresh from the API.
+async function findRecord(kind, id) {
+    if (store.get(id)) return store.get(id);
+    const src = {
+        listing: ['/listings/' + encodeURIComponent(id), d => d.listing],
+        event: ['/events', d => (d.events || []).find(x => x.event_id === id)],
+        tutoring: ['/tutoring', d => (d.listings || []).find(x => x.tutoring_id === id)],
+        society: ['/societies', d => (d.societies || []).find(x => x.society_id === id)],
+        poll: ['/polls', d => (d.polls || []).find(x => x.poll_id === id)]
+    }[kind];
+    if (!src) return null;
+    const rec = src[1](await api(src[0]));
+    if (rec) store.set(id, rec);
+    return rec || null;
+}
+async function openEditForm(kind, id) {
+    const r = await findRecord(kind, id);
+    if (!r) return toast(`Couldn't load that ${kind} to edit (id: ${id || 'missing'}). It may have been deleted - refresh the page.`, 'error');
     const f = (label, name, val, extra = '') => `<div class="form-group"><label>${label}<input name="${name}" value="${esc(val ?? '')}" ${extra}></label></div>`;
     const ta = (val) => `<div class="form-group"><label>Description<textarea name="description">${esc(val || '')}</textarea></label></div>`;
     const body = ({
