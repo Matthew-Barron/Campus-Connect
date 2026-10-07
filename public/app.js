@@ -616,15 +616,15 @@ function openEditForm(kind, id) {
     const r = store.get(id); if (!r) return toast('Reload the page and try again', 'error');
     const f = (label, name, val, extra = '') => `<div class="form-group"><label>${label}<input name="${name}" value="${esc(val ?? '')}" ${extra}></label></div>`;
     const ta = (val) => `<div class="form-group"><label>Description<textarea name="description">${esc(val || '')}</textarea></label></div>`;
-    const body = {
-        listing: f('Title', 'title', r.title, 'maxlength="150" required') + ta(r.description) + f('Price (R)', 'price', r.price, 'type="number" min="0.01" step="0.01" required'),
-        event: f('Title', 'title', r.title, 'maxlength="150" required') + f('Date &amp; time', 'date_time', toLocalInput(r.date_time), 'type="datetime-local" required') + f('Location', 'location', r.location, 'maxlength="200"') + ta(r.description),
-        tutoring: f('Subject', 'subject', r.subject, 'maxlength="100" required') + f('Hourly rate (R)', 'rate', r.rate, 'type="number" min="0.01" step="0.01" required') + f('Availability', 'availability', r.availability, 'maxlength="200"') + ta(r.description),
-        society: f('Name', 'name', r.name, 'maxlength="100" required') + ta(r.description),
-        poll: f('Question', 'question', r.question, 'maxlength="255" required') + f('Closes at', 'closes_at', toLocalInput(r.closes_at), 'type="datetime-local" required') +
+    const body = ({
+        listing: () => f('Title', 'title', r.title, 'maxlength="150" required') + ta(r.description) + f('Price (R)', 'price', r.price, 'type="number" min="0.01" step="0.01" required'),
+        event: () => f('Title', 'title', r.title, 'maxlength="150" required') + f('Date &amp; time', 'date_time', toLocalInput(r.date_time), 'type="datetime-local" required') + f('Location', 'location', r.location, 'maxlength="200"') + ta(r.description),
+        tutoring: () => f('Subject', 'subject', r.subject, 'maxlength="100" required') + f('Hourly rate (R)', 'rate', r.rate, 'type="number" min="0.01" step="0.01" required') + f('Availability', 'availability', r.availability, 'maxlength="200"') + ta(r.description),
+        society: () => f('Name', 'name', r.name, 'maxlength="100" required') + ta(r.description),
+        poll: () => f('Question', 'question', r.question, 'maxlength="255" required') + f('Closes at', 'closes_at', toLocalInput(r.closes_at), 'type="datetime-local" required') +
             (r.vote_count > 0 ? '<p class="meta">Options are locked because people have already voted.</p>' + (r.options || []).map((o, i) => `<input type="hidden" name="opt${i + 1}" value="${esc(o)}">`).join('')
                 : '<p class="meta">Options (at least 2):</p>' + [0, 1, 2, 3].map(i => f(`Option ${i + 1}`, `opt${i + 1}`, (r.options || [])[i] || '', 'maxlength="255"' + (i < 2 ? ' required' : ''))).join(''))
-    }[kind];
+    })[kind]();
     openModal('Edit ' + kind, `<form data-form="edit" novalidate><input type="hidden" name="kind" value="${kind}"><input type="hidden" name="id" value="${esc(id)}">${body}
         <div class="modal-actions"><button type="button" class="btn btn-secondary" data-action="close-modal">Cancel</button><button class="btn" type="submit">Save changes</button></div></form>`);
 }
