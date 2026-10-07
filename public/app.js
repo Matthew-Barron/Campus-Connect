@@ -8,7 +8,13 @@ let token = null;
 let currentUser = null;
 let lastFocus = null;
 let activeThread = null;
-const store = new Map(); // id -> record, used to pre-fill edit forms
+// (kind, id) -> record, used to pre-fill edit forms. Ids are only unique within one table (and may be
+// numbers while DOM data-* attributes are strings), so keys combine the kind with String(id).
+class IdMap extends Map {
+    get(kind, id) { return super.get(kind + ':' + id); }
+    set(kind, id, v) { return super.set(kind + ':' + id, v); }
+}
+const store = new IdMap();
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $('#view');
@@ -302,7 +308,7 @@ async function fetchListings() {
         if (mk.search) qs.set('search', mk.search);
         const { listings } = await api('/listings?' + qs);
         if ($('#mk-list') !== box) return; // user navigated away
-        listings.forEach(l => store.set(l.listing_id, l));
+        listings.forEach(l => store.set('listing', l.listing_id, l));
         box.innerHTML = `<div class="grid">${listings.length ? listings.map(l => `
         <article class="card">
             <div class="row"><h3>${esc(l.title)}</h3><span class="pill pill-${esc(l.status.toLowerCase())}">${esc(l.status)}</span></div>
@@ -325,7 +331,7 @@ const newListingForm = () => openModal('New listing', `
 async function viewListing(id) {
     try {
         const { listing: l, responses, is_owner } = await api(`/listings/${id}`);
-        store.set(id, l);
+        store.set('listing', id, l);
         const ownerTools = is_owner ? `
             <hr><h3>Your listing</h3>
             <div class="toolbar" style="margin:.5rem 0">
@@ -358,7 +364,7 @@ async function loadEvents() {
     try {
         const { events } = await api('/events');
         if ($('#ev-list') !== box) return;
-        events.forEach(e => store.set(e.event_id, e));
+        events.forEach(e => store.set('event', e.event_id, e));
         box.innerHTML = `<div class="grid">${events.length ? events.map(e => {
             const d = new Date(e.date_time), mine = e.organiser_id === currentUser.user_id;
             return `<article class="card">
@@ -397,7 +403,7 @@ async function loadSocieties() {
     try {
         const { societies } = await api('/societies');
         if ($('#so-list') !== box) return;
-        societies.forEach(s => store.set(s.society_id, s));
+        societies.forEach(s => store.set('society', s.society_id, s));
         box.innerHTML = `<div class="grid">${societies.length ? societies.map(s => {
             const mine = s.admin_user_id === currentUser.user_id;
             return `<article class="card">
@@ -433,7 +439,7 @@ async function fetchTutoring() {
     try {
         const { listings } = await api('/tutoring' + (tutorFilter ? '?subject=' + encodeURIComponent(tutorFilter) : ''));
         if ($('#tu-list') !== box) return;
-        listings.forEach(t => store.set(t.tutoring_id, t));
+        listings.forEach(t => store.set('tutoring', t.tutoring_id, t));
         box.innerHTML = `<div class="grid">${listings.length ? listings.map(t => `
         <article class="card">
             <h3>${esc(t.subject)}</h3>
@@ -464,7 +470,7 @@ async function loadPolls() {
     try {
         const { polls } = await api('/polls');
         if ($('#po-list') !== box) return;
-        polls.forEach(p => store.set(p.poll_id, p));
+        polls.forEach(p => store.set('poll', p.poll_id, p));
         box.innerHTML = `<div class="grid">${polls.length ? polls.map(p => {
             const total = p.results ? Object.values(p.results).reduce((a, b) => a + b, 0) : 0;
             const body = p.results
@@ -598,7 +604,9 @@ async function loadMine() {
     try {
         const m = await api('/me/activity');
         if ($('#mine') !== box) return;
-        [...m.listings.map(x => [x.listing_id, x]), ...m.events.map(x => [x.event_id, x]), ...m.tutoring.map(x => [x.tutoring_id, x]), ...m.societies.map(x => [x.society_id, x]), ...m.polls.map(x => [x.poll_id, x])].forEach(([k, v]) => store.set(k, v));
+        m.listings.forEach(x => store.set('listing', x.listing_id, x)); m.events.forEach(x => store.set('event', x.event_id, x));
+        m.tutoring.forEach(x => store.set('tutoring', x.tutoring_id, x)); m.societies.forEach(x => store.set('society', x.society_id, x));
+        m.polls.forEach(x => store.set('poll', x.poll_id, x));
         const btns = (kind, id) => `<button class="btn btn-secondary btn-sm" data-action="edit-item" data-kind="${kind}" data-id="${id}">Edit</button> <button class="btn btn-danger btn-sm" data-action="delete-item" data-kind="${kind}" data-id="${id}">Delete</button>`;
         const sec = (title, rows, empty) => `<section class="card" style="margin-bottom:1rem"><h3>${title}</h3>${rows.length ? rows.join('') : `<p class="meta">${empty}</p>`}</section>`;
         box.innerHTML =
@@ -614,17 +622,17 @@ async function loadMine() {
 // ===== EDIT FORMS =====
 // Finds the record to edit: first in the cache, otherwise fetched fresh from the API.
 async function findRecord(kind, id) {
-    if (store.get(id)) return store.get(id);
+    if (store.get(kind, id)) return store.get(kind, id);
     const src = {
         listing: ['/listings/' + encodeURIComponent(id), d => d.listing],
-        event: ['/events', d => (d.events || []).find(x => x.event_id === id)],
-        tutoring: ['/tutoring', d => (d.listings || []).find(x => x.tutoring_id === id)],
-        society: ['/societies', d => (d.societies || []).find(x => x.society_id === id)],
-        poll: ['/polls', d => (d.polls || []).find(x => x.poll_id === id)]
+        event: ['/events', d => (d.events || []).find(x => String(x.event_id) === String(id))],
+        tutoring: ['/tutoring', d => (d.listings || []).find(x => String(x.tutoring_id) === String(id))],
+        society: ['/societies', d => (d.societies || []).find(x => String(x.society_id) === String(id))],
+        poll: ['/polls', d => (d.polls || []).find(x => String(x.poll_id) === String(id))]
     }[kind];
     if (!src) return null;
     const rec = src[1](await api(src[0]));
-    if (rec) store.set(id, rec);
+    if (rec) store.set(kind, id, rec);
     return rec || null;
 }
 async function openEditForm(kind, id) {
