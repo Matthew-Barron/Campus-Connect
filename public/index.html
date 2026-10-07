@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#5b4fd6">
+    <title>Campus Connect</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E🎓%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <a class="skip-link" href="#view">Skip to content</a>
+
+    <header id="app-header" class="hidden">
+        <div class="bar">
+            <a href="#marketplace" class="logo">🎓 Campus Connect</a>
+            <nav id="main-nav" aria-label="Main">
+                <a href="#marketplace" data-view="marketplace">Marketplace</a>
+                <a href="#events" data-view="events">Events</a>
+                <a href="#societies" data-view="societies">Societies</a>
+                <a href="#tutoring" data-view="tutoring">Tutoring</a>
+                <a href="#polls" data-view="polls">Polls</a>
+            </nav>
+            <div class="user-menu">
+                <div class="bell-wrap">
+                    <button class="icon-btn" id="bell" aria-label="Notifications" aria-haspopup="true" aria-expanded="false">
+                        🔔<span class="badge hidden" id="unread-count">0</span>
+                    </button>
+                    <div id="notif-panel" class="notif-panel hidden" role="region" aria-label="Notifications"></div>
+                </div>
+                <span id="user-name" class="user-name"></span>
+                <button class="btn btn-ghost" id="logout-btn">Log out</button>
+            </div>
+        </div>
+    </header>
+
+    <main id="view" tabindex="-1">
+        <!-- Rendered by app.js -->
+    </main>
+
+    <div id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+    <div id="modal-overlay" class="hidden">
+        <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+            <button class="icon-btn modal-close" id="modal-close" aria-label="Close">✕</button>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+
+    <script src="/vendor/supabase.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

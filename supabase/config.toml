@@ -1,0 +1,35 @@
+# Supabase CLI configuration for Campus Connect.
+project_id = "campus-connect"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[studio]
+enabled = true
+port = 54323
+
+[inbucket]
+enabled = true
+port = 54324
+
+[auth]
+enabled = true
+site_url = "http://localhost:5000"
+additional_redirect_urls = ["http://localhost:5000/**"]
+
+[auth.email]
+enabled = true
+# Set this to true if you want Supabase to require email confirmation.
+auto_confirm = false
+
+[analytics]
+enabled = false
