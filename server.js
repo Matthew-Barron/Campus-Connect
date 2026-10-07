@@ -154,8 +154,27 @@ async function profileMap(client, ids) {
     const queryClient = client === publicClient ? adminClient : client;
     const unique = [...new Set(ids.filter(Boolean))];
     if (!unique.length) return new Map();
-    const { data, error } = await queryClient.from('profiles').select('id,name,email').in('id', unique);
-    if (error) throw new Error(error.message);
+    const { data, error } =
+    await publicClient.auth.signInWithPassword({
+        email,
+        password
+    });
+
+if (error) {
+    console.error('SUPABASE LOGIN ERROR:', {
+        message: error.message,
+        status: error.status,
+        name: error.name,
+        code: error.code
+    });
+
+    return res.status(401).json({ error: 'Invalid credentials' });
+}
+
+if (!data.session || !data.user) {
+    console.error('SUPABASE LOGIN ERROR: No session or user returned');
+    return res.status(401).json({ error: 'Invalid credentials' });
+}
     return new Map((data || []).map(p => [p.id, p]));
 }
 
