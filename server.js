@@ -52,7 +52,9 @@ app.use(helmet({
         }
     }
 }));
-app.use(cors({ origin: process.env.FRONTEND_URL || true, credentials: true }));
+// In production only the configured frontend may call the API cross-origin
+// (same-origin requests are unaffected). Reflecting any origin with credentials is unsafe.
+app.use(cors({ origin: process.env.FRONTEND_URL || (IS_PROD ? false : true), credentials: true }));
 app.use(express.json({ limit: '100kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -90,6 +92,16 @@ const parseError = (error, fallback = 'Database operation failed') => {
     return fallback;
 };
 
+// Converts a Supabase/PostgREST error into an Error carrying a sensible HTTP status.
+const dbError = (error, fallback = 'Database operation failed') => {
+    const err = new Error(parseError(error, fallback));
+    const code = error?.code;
+    if (code === '23505') err.status = 409;
+    else if (code === '23503' || code === '23514' || code === '22P02' || code === '23502') err.status = 400;
+    else if (code === '42501') { err.status = 403; err.message = 'Not authorized'; }
+    return err;
+};
+
 function tokenFromRequest(req) {
     const header = req.headers.authorization || '';
     if (!header.startsWith('Bearer ')) return null;
@@ -103,12 +115,10 @@ function userClient(token) {
     });
 }
 
-async function authenticateToken(req, res, next) {
-    const token = tokenFromRequest(req);
-    if (!token) return res.status(401).json({ error: 'Access token required' });
-
-    const { data: { user }, error } = await publicClient.auth.getUser(token);
-    if (error || !user) return res.status(401).json({ error: 'Session expired. Please log in again.' });
+async function loadUser(token) {
+    const { data, error } = await publicClient.auth.getUser(token);
+    const user = data?.user;
+    if (error || !user) return null;
 
     const db = userClient(token);
     const { data: profile, error: profileError } = await db
@@ -116,12 +126,9 @@ async function authenticateToken(req, res, next) {
         .select('id,name,email,role,is_active')
         .eq('id', user.id)
         .maybeSingle();
+    if (profileError || !profile || !profile.is_active) return null;
 
-    if (profileError || !profile || !profile.is_active) {
-        return res.status(401).json({ error: 'Account not found or inactive' });
-    }
-
-    req.user = {
+    return {
         id: user.id,
         user_id: user.id, // Keep the existing API contract while moving to UUIDs.
         email: user.email,
@@ -131,18 +138,25 @@ async function authenticateToken(req, res, next) {
         token,
         db
     };
-    next();
 }
 
-async function optionalAuth(req, res, next) {
+const authenticateToken = asyncHandler(async (req, res, next) => {
     const token = tokenFromRequest(req);
-    if (!token) return next();
-    try {
-        await authenticateToken(req, res, next);
-    } catch {
-        next();
+    if (!token) return res.status(401).json({ error: 'Access token required' });
+    const user = await loadUser(token);
+    if (!user) return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    req.user = user;
+    next();
+});
+
+// Attaches req.user when a valid token is sent; otherwise continues as anonymous.
+const optionalAuth = asyncHandler(async (req, res, next) => {
+    const token = tokenFromRequest(req);
+    if (token) {
+        try { req.user = (await loadUser(token)) || undefined; } catch { req.user = undefined; }
     }
-}
+    next();
+});
 
 async function notifyUsers(rows) {
     if (!rows?.length) return;
@@ -154,27 +168,8 @@ async function profileMap(client, ids) {
     const queryClient = client === publicClient ? adminClient : client;
     const unique = [...new Set(ids.filter(Boolean))];
     if (!unique.length) return new Map();
-    const { data, error } =
-    await publicClient.auth.signInWithPassword({
-        email,
-        password
-    });
-
-if (error) {
-    console.error('SUPABASE LOGIN ERROR:', {
-        message: error.message,
-        status: error.status,
-        name: error.name,
-        code: error.code
-    });
-
-    return res.status(401).json({ error: 'Invalid credentials' });
-}
-
-if (!data.session || !data.user) {
-    console.error('SUPABASE LOGIN ERROR: No session or user returned');
-    return res.status(401).json({ error: 'Invalid credentials' });
-}
+    const { data, error } = await queryClient.from('profiles').select('id,name,email').in('id', unique);
+    if (error) throw dbError(error);
     return new Map((data || []).map(p => [p.id, p]));
 }
 
@@ -198,10 +193,10 @@ app.post('/auth/register', rateLimit(10, 15 * 60 * 1000), asyncHandler(async (re
     if (!CAMPUS_EMAIL_REGEX.test(email)) return res.status(400).json({ error: 'Use your CPUT student email address ending in @mycput.ac.za' });
 
     const { data: existingEmail, error: emailError } = await adminClient.from('profiles').select('id').eq('email', email).limit(1);
-    if (emailError) throw new Error(emailError.message);
+    if (emailError) throw dbError(emailError);
     if (existingEmail?.length) return res.status(409).json({ error: 'Email or student number already registered' });
     const { data: existingStudent, error: studentError } = await adminClient.from('profiles').select('id').eq('student_number', student_number).limit(1);
-    if (studentError) throw new Error(studentError.message);
+    if (studentError) throw dbError(studentError);
     if (existingStudent?.length) return res.status(409).json({ error: 'Email or student number already registered' });
 
     const { data, error } = await publicClient.auth.signUp({
@@ -210,6 +205,9 @@ app.post('/auth/register', rateLimit(10, 15 * 60 * 1000), asyncHandler(async (re
         options: { data: { name, student_number } }
     });
     if (error) return res.status(400).json({ error: error.message });
+    if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        return res.status(409).json({ error: 'Email or student number already registered' });
+    }
 
     // The database trigger normally creates the profile. The admin upsert makes
     // this endpoint resilient if the trigger was added after an existing Auth user.
@@ -217,7 +215,7 @@ app.post('/auth/register', rateLimit(10, 15 * 60 * 1000), asyncHandler(async (re
         const { error: profileError } = await adminClient.from('profiles').upsert({
             id: data.user.id, name, email, student_number
         }, { onConflict: 'id' });
-        if (profileError) throw new Error(profileError.message);
+        if (profileError) throw dbError(profileError);
     }
 
     if (!data.session) {
@@ -285,8 +283,11 @@ app.post('/auth/reset-password', rateLimit(10, 15 * 60 * 1000), asyncHandler(asy
         return res.status(400).json({ error: 'Password must be at least 8 characters with a letter and number' });
     }
 
-    const recoveryClient = userClient(access_token);
-    const { error } = await recoveryClient.auth.updateUser({ password: new_password });
+    // A per-request client has no stored session, so auth.updateUser() would fail with
+    // "Auth session missing". Verify the recovery token, then update via the admin API.
+    const { data: recovery, error: recoveryError } = await publicClient.auth.getUser(access_token);
+    if (recoveryError || !recovery?.user) return res.status(400).json({ error: 'Recovery link is invalid or has expired' });
+    const { error } = await adminClient.auth.admin.updateUserById(recovery.user.id, { password: new_password });
     if (error) return res.status(400).json({ error: error.message });
     res.json({ message: 'Password reset successfully' });
 }));
@@ -298,7 +299,7 @@ app.get('/auth/me', authenticateToken, asyncHandler(async (req, res) => {
 app.post('/auth/logout', authenticateToken, asyncHandler(async (req, res) => {
     // The browser owns the session. signOut is best-effort; clearing the local
     // session on the client is still required and is handled by Supabase Auth.
-    await req.user.db.auth.signOut().catch(() => {});
+    await adminClient.auth.admin.signOut(req.user.token).catch(() => {});
     res.json({ message: 'Logged out' });
 }));
 
@@ -309,7 +310,7 @@ function toApiUser(profile) {
 
 async function getProfile(client, id) {
     const { data, error } = await client.from('profiles').select('id,name,email,student_number,role,is_active').eq('id', id).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     return data;
 }
 
@@ -328,20 +329,21 @@ app.post('/listings', authenticateToken, asyncHandler(async (req, res) => {
 
     const { data, error } = await req.user.db.from('listings')
         .insert({ user_id: req.user.id, title, description, price, status }).select('listing_id').single();
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     res.status(201).json({ message: 'Listing created', listing_id: data.listing_id });
 }));
 
-app.get('/listings', asyncHandler(async (req, res) => {
+app.get('/listings', optionalAuth, asyncHandler(async (req, res) => {
     const client = req.user?.db || publicClient;
     const status = LISTING_STATUSES.includes(req.query.status) ? req.query.status : null;
-    const search = str(req.query.search);
+    // Strip characters that have meaning inside a PostgREST .or() filter string.
+    const search = str(req.query.search).replace(/[,()*\\]/g, ' ').trim();
     const page = toInt(req.query.page, 1, 1, 100000), limit = toInt(req.query.limit, 20, 1, 100);
     let q = client.from('listings').select('*').order('created_at', { ascending: false }).range((page - 1) * limit, page * limit - 1);
     if (status) q = q.eq('status', status);
     if (search) q = q.or(`title.ilike.%${search}%,description.ilike.%${search}%`);
     const { data, error } = await q;
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     const profiles = await profileMap(client, (data || []).map(x => x.user_id));
     const listings = (data || []).map(l => ({ ...l, price: Number(l.price), seller_name: profiles.get(l.user_id)?.name || 'Unknown' }));
     res.json({ listings, pagination: { page, limit } });
@@ -350,7 +352,7 @@ app.get('/listings', asyncHandler(async (req, res) => {
 app.get('/listings/:listing_id', optionalAuth, asyncHandler(async (req, res) => {
     const client = req.user?.db || publicClient;
     const { data: listing, error } = await client.from('listings').select('*').eq('listing_id', req.params.listing_id).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     if (!listing) return res.status(404).json({ error: 'Listing not found' });
     const profiles = await profileMap(client, [listing.user_id]);
     const seller = profiles.get(listing.user_id);
@@ -361,7 +363,7 @@ app.get('/listings/:listing_id', optionalAuth, asyncHandler(async (req, res) => 
     let responses = [];
     if (is_owner) {
         const { data, error: responseError } = await client.from('listing_responses').select('*').eq('listing_id', req.params.listing_id).order('created_at', { ascending: false });
-        if (responseError) throw new Error(responseError.message);
+        if (responseError) throw dbError(responseError);
         const responderProfiles = await profileMap(client, (data || []).map(x => x.responder_id));
         responses = (data || []).map(r => ({ ...r, responder_name: responderProfiles.get(r.responder_id)?.name || 'Unknown', responder_email: responderProfiles.get(r.responder_id)?.email || null }));
     }
@@ -370,7 +372,7 @@ app.get('/listings/:listing_id', optionalAuth, asyncHandler(async (req, res) => 
 
 app.put('/listings/:listing_id', authenticateToken, asyncHandler(async (req, res) => {
     const { data: listing, error: findError } = await req.user.db.from('listings').select('user_id').eq('listing_id', req.params.listing_id).maybeSingle();
-    if (findError) throw new Error(findError.message);
+    if (findError) throw dbError(findError);
     if (!listing) return res.status(404).json({ error: 'Listing not found' });
     if (listing.user_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
 
@@ -383,7 +385,7 @@ app.put('/listings/:listing_id', authenticateToken, asyncHandler(async (req, res
     if (req.body.description !== undefined) update.description = str(req.body.description);
     if (req.body.price !== undefined) {
         const price = Number(req.body.price);
-        if (!Number.isFinite(price) || price <= 0) return res.status(400).json({ error: 'Price must be greater than 0' });
+        if (!Number.isFinite(price) || price <= 0 || price >= 100000000) return res.status(400).json({ error: 'Price must be greater than 0' });
         update.price = price;
     }
     if (req.body.status !== undefined) {
@@ -392,17 +394,17 @@ app.put('/listings/:listing_id', authenticateToken, asyncHandler(async (req, res
     }
     if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
     const { error } = await req.user.db.from('listings').update(update).eq('listing_id', req.params.listing_id).eq('user_id', req.user.id);
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     res.json({ message: 'Listing updated' });
 }));
 
 app.delete('/listings/:listing_id', authenticateToken, asyncHandler(async (req, res) => {
     const { data: listing, error } = await req.user.db.from('listings').select('user_id').eq('listing_id', req.params.listing_id).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     if (!listing) return res.status(404).json({ error: 'Listing not found' });
     if (listing.user_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
     const { error: deleteError } = await req.user.db.from('listings').delete().eq('listing_id', req.params.listing_id).eq('user_id', req.user.id);
-    if (deleteError) throw new Error(deleteError.message);
+    if (deleteError) throw dbError(deleteError);
     res.json({ message: 'Listing deleted' });
 }));
 
@@ -410,12 +412,12 @@ app.post('/listings/:listing_id/responses', authenticateToken, asyncHandler(asyn
     const message = str(req.body.message);
     if (message.length < 1 || message.length > 500) return res.status(400).json({ error: 'Message must be 1-500 characters' });
     const { data: listing, error: findError } = await req.user.db.from('listings').select('user_id,title').eq('listing_id', req.params.listing_id).maybeSingle();
-    if (findError) throw new Error(findError.message);
+    if (findError) throw dbError(findError);
     if (!listing) return res.status(404).json({ error: 'Listing not found' });
     if (listing.user_id === req.user.id) return res.status(400).json({ error: "You can't respond to your own listing" });
 
     const { data, error } = await req.user.db.from('listing_responses').insert({ listing_id: req.params.listing_id, responder_id: req.user.id, message }).select('response_id').single();
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     await notifyUsers([{ user_id: listing.user_id, type: 'Listing', message: `${req.user.email} responded to your listing`, related_listing_id: req.params.listing_id }]);
     res.status(201).json({ message: 'Response saved', response_id: data.response_id });
 }));
@@ -430,10 +432,10 @@ app.post('/events', authenticateToken, asyncHandler(async (req, res) => {
     if (title.length > 150 || location.length > 200) return res.status(400).json({ error: 'Title or location too long' });
 
     const { data, error } = await req.user.db.from('events').insert({ organiser_id: req.user.id, title, description, location, date_time }).select('event_id').single();
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
 
     const { data: users, error: usersError } = await adminClient.from('profiles').select('id').eq('is_active', true).neq('id', req.user.id);
-    if (usersError) throw new Error(usersError.message);
+    if (usersError) throw dbError(usersError);
     await notifyUsers((users || []).map(u => ({ user_id: u.id, type: 'Event', message: `New event: ${title}`, related_event_id: data.event_id })));
     res.status(201).json({ message: 'Event created', event_id: data.event_id });
 }));
@@ -443,12 +445,12 @@ app.get('/events', optionalAuth, asyncHandler(async (req, res) => {
     const page = toInt(req.query.page, 1, 1, 100000), limit = toInt(req.query.limit, 50, 1, 100);
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const { data: events, error } = await client.from('events').select('*').gte('date_time', cutoff).order('date_time', { ascending: true }).range((page - 1) * limit, page * limit - 1);
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     const profiles = await profileMap(client, (events || []).map(e => e.organiser_id));
     let rsvps = [];
     if (req.user && events?.length) {
         const { data, error: rsvpError } = await client.from('event_rsvps').select('event_id,rsvp_status').eq('user_id', req.user.id).in('event_id', events.map(e => e.event_id));
-        if (rsvpError) throw new Error(rsvpError.message);
+        if (rsvpError) throw dbError(rsvpError);
         rsvps = data || [];
     }
     const rsvpMap = new Map(rsvps.map(r => [r.event_id, r.rsvp_status]));
@@ -469,10 +471,10 @@ app.post('/events/:event_id/rsvp', authenticateToken, asyncHandler(async (req, r
     const validStatuses = ['Attending', 'Not_Attending', 'Interested'];
     if (!validStatuses.includes(req.body.rsvp_status)) return res.status(400).json({ error: 'Invalid RSVP status' });
     const { data: event, error: findError } = await req.user.db.from('events').select('event_id').eq('event_id', req.params.event_id).maybeSingle();
-    if (findError) throw new Error(findError.message);
+    if (findError) throw dbError(findError);
     if (!event) return res.status(404).json({ error: 'Event not found' });
     const { error } = await req.user.db.from('event_rsvps').upsert({ event_id: req.params.event_id, user_id: req.user.id, rsvp_status: req.body.rsvp_status }, { onConflict: 'event_id,user_id' });
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     res.json({ message: 'RSVP saved' });
 }));
 
@@ -487,28 +489,30 @@ app.post('/polls', authenticateToken, asyncHandler(async (req, res) => {
     if (question.length > 255 || options.length > 10 || options.some(o => o.length > 255)) return res.status(400).json({ error: 'Question or options too long' });
     if (!closes_at || new Date(closes_at) <= new Date()) return res.status(400).json({ error: 'Closing time must be in the future' });
     const { data, error } = await req.user.db.from('polls').insert({ created_by: req.user.id, question, options, closes_at }).select('poll_id').single();
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     res.status(201).json({ message: 'Poll created', poll_id: data.poll_id });
 }));
 
 app.get('/polls', optionalAuth, asyncHandler(async (req, res) => {
     const client = req.user?.db || publicClient;
     const { data: polls, error } = await client.from('polls').select('*').gt('closes_at', new Date(Date.now() - 7 * 86400000).toISOString()).order('closes_at', { ascending: true });
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     const rows = polls || [];
     const profiles = await profileMap(client, rows.map(p => p.created_by));
     let votes = [];
     if (req.user) {
         const { data, error: votesError } = await client.from('poll_votes').select('poll_id,user_id,selected_option').eq('user_id', req.user.id);
-        if (votesError) throw new Error(votesError.message);
+        if (votesError) throw dbError(votesError);
         votes = data || [];
     }
     const myVotes = new Map(votes.map(v => [v.poll_id, v.selected_option]));
 
     // Vote counts/results are intentionally calculated server-side with service_role
     // so users do not need broad read access to other users' votes.
-    const { data: allVotes, error: allVotesError } = await adminClient.from('poll_votes').select('poll_id,selected_option');
-    if (allVotesError) throw new Error(allVotesError.message);
+    const pollIds = rows.map(p => p.poll_id);
+    let allVotes = [], allVotesError = null;
+    if (pollIds.length) ({ data: allVotes, error: allVotesError } = await adminClient.from('poll_votes').select('poll_id,selected_option').in('poll_id', pollIds));
+    if (allVotesError) throw dbError(allVotesError);
     const result = rows.map(p => {
         const my_vote = myVotes.get(p.poll_id) || null;
         const is_active = new Date(p.closes_at) > new Date();
@@ -528,13 +532,13 @@ app.post('/polls/:poll_id/vote', authenticateToken, asyncHandler(async (req, res
     const selected_option = str(req.body.selected_option);
     if (!selected_option) return res.status(400).json({ error: 'Selected option required' });
     const { data: poll, error: findError } = await req.user.db.from('polls').select('closes_at,options').eq('poll_id', req.params.poll_id).maybeSingle();
-    if (findError) throw new Error(findError.message);
+    if (findError) throw dbError(findError);
     if (!poll) return res.status(404).json({ error: 'Poll not found' });
     if (new Date(poll.closes_at) <= new Date()) return res.status(400).json({ error: 'Poll is closed' });
     if (!Array.isArray(poll.options) || !poll.options.includes(selected_option)) return res.status(400).json({ error: 'Invalid option' });
     const { error } = await req.user.db.from('poll_votes').insert({ poll_id: req.params.poll_id, user_id: req.user.id, selected_option });
     if (error?.code === '23505') return res.status(409).json({ error: 'You have already voted' });
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     res.status(201).json({ message: 'Vote saved' });
 }));
 
@@ -546,21 +550,23 @@ app.post('/societies', authenticateToken, asyncHandler(async (req, res) => {
     if (!name) return res.status(400).json({ error: 'Society name required' });
     if (name.length > 100) return res.status(400).json({ error: 'Name must be 100 characters or fewer' });
     const { data, error } = await req.user.db.from('societies').insert({ name, description, admin_user_id: req.user.id }).select('society_id').single();
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     const { error: memberError } = await req.user.db.from('society_members').upsert({ society_id: data.society_id, user_id: req.user.id }, { onConflict: 'society_id,user_id' });
-    if (memberError) throw new Error(parseError(memberError));
+    if (memberError) throw dbError(memberError);
     res.status(201).json({ message: 'Society created', society_id: data.society_id });
 }));
 
 app.get('/societies', optionalAuth, asyncHandler(async (req, res) => {
     const client = req.user?.db || publicClient;
     const { data: societies, error } = await client.from('societies').select('*').order('created_at', { ascending: false });
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     const rows = societies || [];
     const admins = await profileMap(client, rows.map(s => s.admin_user_id));
     const membershipClient = adminClient;
-    const { data: members, error: memberError } = await membershipClient.from('society_members').select('society_id,user_id');
-    if (memberError) throw new Error(memberError.message);
+    const { data: members, error: memberError } = rows.length
+        ? await membershipClient.from('society_members').select('society_id,user_id').in('society_id', rows.map(s => s.society_id))
+        : { data: [], error: null };
+    if (memberError) throw dbError(memberError);
     const counts = new Map(), mine = new Set();
     for (const m of members || []) {
         counts.set(m.society_id, (counts.get(m.society_id) || 0) + 1);
@@ -571,26 +577,26 @@ app.get('/societies', optionalAuth, asyncHandler(async (req, res) => {
 
 app.post('/societies/:society_id/join', authenticateToken, asyncHandler(async (req, res) => {
     const { data: society, error } = await req.user.db.from('societies').select('society_id').eq('society_id', req.params.society_id).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     if (!society) return res.status(404).json({ error: 'Society not found' });
     const { error: insertError } = await req.user.db.from('society_members').upsert({ society_id: req.params.society_id, user_id: req.user.id }, { onConflict: 'society_id,user_id', ignoreDuplicates: true });
-    if (insertError) throw new Error(parseError(insertError));
+    if (insertError) throw dbError(insertError);
     res.json({ message: 'Joined society' });
 }));
 
 app.delete('/societies/:society_id/leave', authenticateToken, asyncHandler(async (req, res) => {
     const { error } = await req.user.db.from('society_members').delete().eq('society_id', req.params.society_id).eq('user_id', req.user.id);
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     res.json({ message: 'Left society' });
 }));
 
 app.get('/societies/:society_id/members', authenticateToken, asyncHandler(async (req, res) => {
     const { data: society, error } = await req.user.db.from('societies').select('admin_user_id').eq('society_id', req.params.society_id).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     if (!society) return res.status(404).json({ error: 'Society not found' });
     if (society.admin_user_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
     const { data: members, error: memberError } = await req.user.db.from('society_members').select('user_id,joined_at').eq('society_id', req.params.society_id).order('joined_at', { ascending: false });
-    if (memberError) throw new Error(memberError.message);
+    if (memberError) throw dbError(memberError);
     const profiles = await profileMap(req.user.db, (members || []).map(m => m.user_id));
     res.json({ members: (members || []).map(m => ({ user_id: m.user_id, name: profiles.get(m.user_id)?.name, email: profiles.get(m.user_id)?.email, joined_at: m.joined_at })) });
 }));
@@ -605,7 +611,7 @@ app.post('/tutoring', authenticateToken, asyncHandler(async (req, res) => {
     if (subject.length > 100 || availability.length > 200) return res.status(400).json({ error: 'Subject or availability too long' });
     if (!Number.isFinite(rate) || rate <= 0 || rate >= 100000000) return res.status(400).json({ error: 'Rate must be greater than 0' });
     const { data, error } = await req.user.db.from('tutoring_listings').insert({ tutor_id: req.user.id, subject, rate, availability, description }).select('tutoring_id').single();
-    if (error) throw new Error(parseError(error));
+    if (error) throw dbError(error);
     res.status(201).json({ message: 'Tutoring listing created', tutoring_id: data.tutoring_id });
 }));
 
@@ -615,7 +621,7 @@ app.get('/tutoring', optionalAuth, asyncHandler(async (req, res) => {
     let q = client.from('tutoring_listings').select('*').order('created_at', { ascending: false });
     if (subject) q = q.ilike('subject', `%${subject}%`);
     const { data, error } = await q;
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     const profiles = await profileMap(client, (data || []).map(t => t.tutor_id));
     res.json({ listings: (data || []).map(t => ({ ...t, rate: Number(t.rate), tutor_name: profiles.get(t.tutor_id)?.name || 'Unknown', ...(req.user ? { tutor_email: profiles.get(t.tutor_id)?.email || null } : {}) })) });
 }));
@@ -625,21 +631,21 @@ app.get('/tutoring', optionalAuth, asyncHandler(async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get('/notifications', authenticateToken, asyncHandler(async (req, res) => {
     const { data: notifications, error } = await req.user.db.from('notifications').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false }).limit(50);
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     const { count, error: countError } = await req.user.db.from('notifications').select('notification_id', { count: 'exact', head: true }).eq('user_id', req.user.id).eq('is_read', false);
-    if (countError) throw new Error(countError.message);
+    if (countError) throw dbError(countError);
     res.json({ notifications: notifications || [], unread_count: count || 0 });
 }));
 
 app.put('/notifications/:notification_id/read', authenticateToken, asyncHandler(async (req, res) => {
     const { error } = await req.user.db.from('notifications').update({ is_read: true }).eq('notification_id', req.params.notification_id).eq('user_id', req.user.id);
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     res.json({ message: 'Notification marked as read' });
 }));
 
 app.put('/notifications/read-all', authenticateToken, asyncHandler(async (req, res) => {
     const { error } = await req.user.db.from('notifications').update({ is_read: true }).eq('user_id', req.user.id);
-    if (error) throw new Error(error.message);
+    if (error) throw dbError(error);
     res.json({ message: 'All notifications marked as read' });
 }));
 
@@ -654,16 +660,19 @@ app.get('/health', asyncHandler(async (req, res) => {
 
 app.use((req, res) => res.status(404).json({ error: 'Endpoint not found' }));
 app.use((err, req, res, next) => {
-    console.error(err);
-    const message = IS_PROD ? 'Internal server error' : (err.message || 'Internal server error');
-    res.status(500).json({ error: message });
+    const status = Number(err.status || err.statusCode) || 500;
+    if (status >= 500) console.error(err);
+    if (res.headersSent) return next(err);
+    const message = status < 500 ? (err.type === 'entity.parse.failed' ? 'Invalid JSON body' : err.message)
+        : (IS_PROD ? 'Internal server error' : (err.message || 'Internal server error'));
+    res.status(status).json({ error: message });
 });
 
 app.listen(PORT, () => {
-    console.log(`\n🚀 Campus Connect Backend Running`);
-    console.log(`📍 Server: http://localhost:${PORT}`);
-    console.log(`🗄️  Database: Supabase PostgreSQL`);
-    console.log(`🔐 Authentication: Supabase Auth`);
-    console.log(`🛡️  Authorization: PostgreSQL RLS + backend checks`);
-    console.log(`✅ Health Check: GET /health\n`);
+    console.log(`\n Campus Connect Backend Running`);
+    console.log(` Server: http://localhost:${PORT}`);
+    console.log(`  Database: Supabase PostgreSQL`);
+    console.log(` Authentication: Supabase Auth`);
+    console.log(`  Authorization: PostgreSQL RLS + backend checks`);
+    console.log(` Health Check: GET /health\n`);
 });
