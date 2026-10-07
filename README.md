@@ -201,3 +201,11 @@ The browser Supabase client is bundled locally at `public/vendor/supabase.js` in
 This application currently sends authentication emails through Supabase Auth (account confirmation/password reset). Listing messages are stored as in-app notifications and do not currently send outbound email.
 
 There is no email address belonging to ChatGPT that the application can send to. If you want application messages/test emails delivered to a specific inbox, configure an email provider (SMTP/Resend/etc.) and a real recipient address; do not put provider secrets in `public/` or frontend JavaScript.
+
+## Messaging, edit/delete & activity (v2.1)
+
+- **Messages**: message a seller, tutor, event organiser or any user (tap a name to open their profile). Threads are private to the two participants, show "seen" status and refresh automatically.
+- **Edit/delete** your own listings, events, tutoring offers, societies; delete your polls. Attendees of an edited/cancelled event are notified.
+- **My activity**: everything you posted or joined, in one place.
+- **Notifications**: everyone is notified (with a pop-up toast) about new listings, events, polls, societies and tutoring offers; organisers are told when someone RSVPs "Going"; society admins when someone joins.
+- **Required DB migration**: apply `supabase/migrations/20261007170000_messaging.sql` (additive; no existing data changes). Fresh installs: `DATABASE_SCHEMA.sql` already includes it.

@@ -164,6 +164,13 @@ async function notifyUsers(rows) {
     if (error) console.error('Notification insert failed:', error.message);
 }
 
+// Notify every active user (except the author) about new content.
+async function broadcast(exceptId, fields) {
+    const { data: users, error } = await adminClient.from('profiles').select('id').eq('is_active', true).neq('id', exceptId);
+    if (error) { console.error('Broadcast lookup failed:', error.message); return; }
+    await notifyUsers((users || []).map(u => ({ user_id: u.id, ...fields, message: String(fields.message).slice(0, 500) })));
+}
+
 async function profileMap(client, ids) {
     const queryClient = client === publicClient ? adminClient : client;
     const unique = [...new Set(ids.filter(Boolean))];
@@ -330,6 +337,7 @@ app.post('/listings', authenticateToken, asyncHandler(async (req, res) => {
     const { data, error } = await req.user.db.from('listings')
         .insert({ user_id: req.user.id, title, description, price, status }).select('listing_id').single();
     if (error) throw dbError(error);
+    await broadcast(req.user.id, { type: 'Listing', message: `New listing: ${title} (R${price.toFixed(2)})`, related_listing_id: data.listing_id });
     res.status(201).json({ message: 'Listing created', listing_id: data.listing_id });
 }));
 
@@ -434,9 +442,7 @@ app.post('/events', authenticateToken, asyncHandler(async (req, res) => {
     const { data, error } = await req.user.db.from('events').insert({ organiser_id: req.user.id, title, description, location, date_time }).select('event_id').single();
     if (error) throw dbError(error);
 
-    const { data: users, error: usersError } = await adminClient.from('profiles').select('id').eq('is_active', true).neq('id', req.user.id);
-    if (usersError) throw dbError(usersError);
-    await notifyUsers((users || []).map(u => ({ user_id: u.id, type: 'Event', message: `New event: ${title}`, related_event_id: data.event_id })));
+    await broadcast(req.user.id, { type: 'Event', message: `New event: ${title}`, related_event_id: data.event_id });
     res.status(201).json({ message: 'Event created', event_id: data.event_id });
 }));
 
@@ -470,11 +476,12 @@ app.get('/events', optionalAuth, asyncHandler(async (req, res) => {
 app.post('/events/:event_id/rsvp', authenticateToken, asyncHandler(async (req, res) => {
     const validStatuses = ['Attending', 'Not_Attending', 'Interested'];
     if (!validStatuses.includes(req.body.rsvp_status)) return res.status(400).json({ error: 'Invalid RSVP status' });
-    const { data: event, error: findError } = await req.user.db.from('events').select('event_id').eq('event_id', req.params.event_id).maybeSingle();
+    const { data: event, error: findError } = await req.user.db.from('events').select('event_id,organiser_id,title').eq('event_id', req.params.event_id).maybeSingle();
     if (findError) throw dbError(findError);
     if (!event) return res.status(404).json({ error: 'Event not found' });
     const { error } = await req.user.db.from('event_rsvps').upsert({ event_id: req.params.event_id, user_id: req.user.id, rsvp_status: req.body.rsvp_status }, { onConflict: 'event_id,user_id' });
     if (error) throw dbError(error);
+    if (req.body.rsvp_status === 'Attending' && event.organiser_id !== req.user.id) await notifyUsers([{ user_id: event.organiser_id, type: 'Event', message: `${req.user.name} is attending ${event.title}`, related_event_id: event.event_id }]);
     res.json({ message: 'RSVP saved' });
 }));
 
@@ -490,6 +497,7 @@ app.post('/polls', authenticateToken, asyncHandler(async (req, res) => {
     if (!closes_at || new Date(closes_at) <= new Date()) return res.status(400).json({ error: 'Closing time must be in the future' });
     const { data, error } = await req.user.db.from('polls').insert({ created_by: req.user.id, question, options, closes_at }).select('poll_id').single();
     if (error) throw dbError(error);
+    await broadcast(req.user.id, { type: 'Poll', message: `New poll: ${question}`, related_poll_id: data.poll_id });
     res.status(201).json({ message: 'Poll created', poll_id: data.poll_id });
 }));
 
@@ -553,6 +561,7 @@ app.post('/societies', authenticateToken, asyncHandler(async (req, res) => {
     if (error) throw dbError(error);
     const { error: memberError } = await req.user.db.from('society_members').upsert({ society_id: data.society_id, user_id: req.user.id }, { onConflict: 'society_id,user_id' });
     if (memberError) throw dbError(memberError);
+    await broadcast(req.user.id, { type: 'Society', message: `New society: ${name}` });
     res.status(201).json({ message: 'Society created', society_id: data.society_id });
 }));
 
@@ -581,6 +590,8 @@ app.post('/societies/:society_id/join', authenticateToken, asyncHandler(async (r
     if (!society) return res.status(404).json({ error: 'Society not found' });
     const { error: insertError } = await req.user.db.from('society_members').upsert({ society_id: req.params.society_id, user_id: req.user.id }, { onConflict: 'society_id,user_id', ignoreDuplicates: true });
     if (insertError) throw dbError(insertError);
+    const { data: soc } = await adminClient.from('societies').select('name,admin_user_id').eq('society_id', req.params.society_id).maybeSingle();
+    if (soc?.admin_user_id && soc.admin_user_id !== req.user.id) await notifyUsers([{ user_id: soc.admin_user_id, type: 'Society', message: `${req.user.name} joined ${soc.name}` }]);
     res.json({ message: 'Joined society' });
 }));
 
@@ -612,6 +623,7 @@ app.post('/tutoring', authenticateToken, asyncHandler(async (req, res) => {
     if (!Number.isFinite(rate) || rate <= 0 || rate >= 100000000) return res.status(400).json({ error: 'Rate must be greater than 0' });
     const { data, error } = await req.user.db.from('tutoring_listings').insert({ tutor_id: req.user.id, subject, rate, availability, description }).select('tutoring_id').single();
     if (error) throw dbError(error);
+    await broadcast(req.user.id, { type: 'System', message: `New tutoring offer: ${subject} (R${rate.toFixed(2)}/hr)` });
     res.status(201).json({ message: 'Tutoring listing created', tutoring_id: data.tutoring_id });
 }));
 
@@ -647,6 +659,282 @@ app.put('/notifications/read-all', authenticateToken, asyncHandler(async (req, r
     const { error } = await req.user.db.from('notifications').update({ is_read: true }).eq('user_id', req.user.id);
     if (error) throw dbError(error);
     res.json({ message: 'All notifications marked as read' });
+}));
+
+// -----------------------------------------------------------------------------
+// Edit / delete for events, polls, societies and tutoring (owner only)
+// -----------------------------------------------------------------------------
+// Loads a row through the caller's RLS-scoped client and verifies ownership.
+async function loadOwned(req, res, table, idCol, ownerCol, cols) {
+    const { data, error } = await req.user.db.from(table).select(`${idCol},${ownerCol},${cols}`).eq(idCol, req.params.id).maybeSingle();
+    if (error) throw dbError(error);
+    if (!data) { res.status(404).json({ error: 'Not found' }); return null; }
+    if (data[ownerCol] !== req.user.id) { res.status(403).json({ error: 'Not authorized' }); return null; }
+    return data;
+}
+
+app.put('/events/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const ev = await loadOwned(req, res, 'events', 'event_id', 'organiser_id', 'title'); if (!ev) return;
+    const update = {};
+    if (req.body.title !== undefined) { const t = str(req.body.title); if (!t || t.length > 150) return res.status(400).json({ error: 'Invalid title' }); update.title = t; }
+    if (req.body.description !== undefined) update.description = str(req.body.description);
+    if (req.body.location !== undefined) { const l = str(req.body.location); if (l.length > 200) return res.status(400).json({ error: 'Location too long' }); update.location = l; }
+    if (req.body.date_time !== undefined) { const d = toIso(req.body.date_time); if (!d) return res.status(400).json({ error: 'Invalid date' }); update.date_time = d; }
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+    const { error } = await req.user.db.from('events').update(update).eq('event_id', ev.event_id).eq('organiser_id', req.user.id);
+    if (error) throw dbError(error);
+    const { data: rsvps } = await adminClient.from('event_rsvps').select('user_id').eq('event_id', ev.event_id).neq('rsvp_status', 'Not_Attending').neq('user_id', req.user.id);
+    await notifyUsers((rsvps || []).map(r => ({ user_id: r.user_id, type: 'Event', message: `Event updated: ${update.title || ev.title}`, related_event_id: ev.event_id })));
+    res.json({ message: 'Event updated' });
+}));
+
+app.delete('/events/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const ev = await loadOwned(req, res, 'events', 'event_id', 'organiser_id', 'title'); if (!ev) return;
+    const { data: rsvps } = await adminClient.from('event_rsvps').select('user_id').eq('event_id', ev.event_id).neq('rsvp_status', 'Not_Attending').neq('user_id', req.user.id);
+    const { error } = await req.user.db.from('events').delete().eq('event_id', ev.event_id).eq('organiser_id', req.user.id);
+    if (error) throw dbError(error);
+    await notifyUsers((rsvps || []).map(r => ({ user_id: r.user_id, type: 'Event', message: `Event cancelled: ${ev.title}` })));
+    res.json({ message: 'Event deleted' });
+}));
+
+app.get('/events/:id/attendees', authenticateToken, asyncHandler(async (req, res) => {
+    const ev = await loadOwned(req, res, 'events', 'event_id', 'organiser_id', 'title'); if (!ev) return;
+    const { data, error } = await adminClient.from('event_rsvps').select('user_id,rsvp_status,updated_at').eq('event_id', ev.event_id).neq('rsvp_status', 'Not_Attending');
+    if (error) throw dbError(error);
+    const profiles = await profileMap(adminClient, (data || []).map(r => r.user_id));
+    res.json({ attendees: (data || []).map(r => ({ user_id: r.user_id, name: profiles.get(r.user_id)?.name || 'Unknown', rsvp_status: r.rsvp_status })) });
+}));
+
+app.put('/polls/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const poll = await loadOwned(req, res, 'polls', 'poll_id', 'created_by', 'question'); if (!poll) return;
+    const update = {};
+    if (req.body.question !== undefined) { const q = str(req.body.question); if (!q || q.length > 255) return res.status(400).json({ error: 'Invalid question' }); update.question = q; }
+    if (req.body.closes_at !== undefined) { const c = toIso(req.body.closes_at); if (!c) return res.status(400).json({ error: 'Invalid closing time' }); update.closes_at = c; }
+    if (req.body.options !== undefined) {
+        const options = Array.isArray(req.body.options) ? [...new Set(req.body.options.map(str).filter(Boolean))] : [];
+        if (options.length < 2 || options.length > 10 || options.some(o => o.length > 255)) return res.status(400).json({ error: 'At least 2 different options required' });
+        const { data: current } = await adminClient.from('polls').select('options').eq('poll_id', poll.poll_id).maybeSingle();
+        const changed = JSON.stringify(current?.options) !== JSON.stringify(options);
+        if (changed) {
+            const { count, error: cErr } = await adminClient.from('poll_votes').select('poll_id', { count: 'exact', head: true }).eq('poll_id', poll.poll_id);
+            if (cErr) throw dbError(cErr);
+            if (count > 0) return res.status(409).json({ error: 'Options can’t be changed after people have voted. You can still edit the question or closing time.' });
+            update.options = options;
+        }
+    }
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+    const { error } = await req.user.db.from('polls').update(update).eq('poll_id', poll.poll_id).eq('created_by', req.user.id);
+    if (error) throw dbError(error);
+    res.json({ message: 'Poll updated' });
+}));
+
+app.delete('/polls/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const poll = await loadOwned(req, res, 'polls', 'poll_id', 'created_by', 'question'); if (!poll) return;
+    const { error } = await req.user.db.from('polls').delete().eq('poll_id', poll.poll_id).eq('created_by', req.user.id);
+    if (error) throw dbError(error);
+    res.json({ message: 'Poll deleted' });
+}));
+
+app.put('/tutoring/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const t = await loadOwned(req, res, 'tutoring_listings', 'tutoring_id', 'tutor_id', 'subject'); if (!t) return;
+    const update = {};
+    if (req.body.subject !== undefined) { const v = str(req.body.subject); if (!v || v.length > 100) return res.status(400).json({ error: 'Invalid subject' }); update.subject = v; }
+    if (req.body.rate !== undefined) { const r = Number(req.body.rate); if (!Number.isFinite(r) || r <= 0 || r >= 100000000) return res.status(400).json({ error: 'Rate must be greater than 0' }); update.rate = r; }
+    if (req.body.availability !== undefined) { const a = str(req.body.availability); if (a.length > 200) return res.status(400).json({ error: 'Availability too long' }); update.availability = a; }
+    if (req.body.description !== undefined) update.description = str(req.body.description);
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+    const { error } = await req.user.db.from('tutoring_listings').update(update).eq('tutoring_id', t.tutoring_id).eq('tutor_id', req.user.id);
+    if (error) throw dbError(error);
+    res.json({ message: 'Tutoring listing updated' });
+}));
+
+app.delete('/tutoring/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const t = await loadOwned(req, res, 'tutoring_listings', 'tutoring_id', 'tutor_id', 'subject'); if (!t) return;
+    const { error } = await req.user.db.from('tutoring_listings').delete().eq('tutoring_id', t.tutoring_id).eq('tutor_id', req.user.id);
+    if (error) throw dbError(error);
+    res.json({ message: 'Tutoring listing deleted' });
+}));
+
+app.put('/societies/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const s = await loadOwned(req, res, 'societies', 'society_id', 'admin_user_id', 'name'); if (!s) return;
+    const update = {};
+    if (req.body.name !== undefined) { const n = str(req.body.name); if (!n || n.length > 100) return res.status(400).json({ error: 'Invalid name' }); update.name = n; }
+    if (req.body.description !== undefined) update.description = str(req.body.description);
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+    const { error } = await req.user.db.from('societies').update(update).eq('society_id', s.society_id).eq('admin_user_id', req.user.id);
+    if (error) throw dbError(error);
+    res.json({ message: 'Society updated' });
+}));
+
+app.delete('/societies/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const s = await loadOwned(req, res, 'societies', 'society_id', 'admin_user_id', 'name'); if (!s) return;
+    const { error } = await req.user.db.from('societies').delete().eq('society_id', s.society_id).eq('admin_user_id', req.user.id);
+    if (error) throw dbError(error);
+    res.json({ message: 'Society deleted' });
+}));
+
+// -----------------------------------------------------------------------------
+// Profiles & "my activity"
+// -----------------------------------------------------------------------------
+app.get('/users/:id', authenticateToken, asyncHandler(async (req, res) => {
+    const id = req.params.id, db = req.user.db;
+    const { data: profile, error } = await db.from('profiles').select('id,name,role,created_at').eq('id', id).maybeSingle();
+    if (error) throw dbError(error);
+    if (!profile) return res.status(404).json({ error: 'User not found' });
+    const [listings, tutoring, events, societies, polls] = await Promise.all([
+        db.from('listings').select('listing_id,title,price,status,created_at').eq('user_id', id).order('created_at', { ascending: false }).limit(20),
+        db.from('tutoring_listings').select('tutoring_id,subject,rate,availability').eq('tutor_id', id).order('created_at', { ascending: false }).limit(20),
+        db.from('events').select('event_id,title,date_time,location').eq('organiser_id', id).gte('date_time', new Date().toISOString()).order('date_time').limit(20),
+        db.from('societies').select('society_id,name').eq('admin_user_id', id).limit(20),
+        db.from('polls').select('poll_id,question,closes_at').eq('created_by', id).order('created_at', { ascending: false }).limit(10)
+    ]);
+    for (const r of [listings, tutoring, events, societies, polls]) if (r.error) throw dbError(r.error);
+    res.json({
+        user: { user_id: profile.id, name: profile.name, role: profile.role, member_since: profile.created_at, is_me: profile.id === req.user.id },
+        listings: (listings.data || []).map(l => ({ ...l, price: Number(l.price) })),
+        tutoring: (tutoring.data || []).map(t => ({ ...t, rate: Number(t.rate) })),
+        events: events.data || [], societies: societies.data || [], polls: polls.data || []
+    });
+}));
+
+app.get('/me/activity', authenticateToken, asyncHandler(async (req, res) => {
+    const db = req.user.db, id = req.user.id;
+    const [listings, tutoring, events, societies, polls, rsvps, memberships] = await Promise.all([
+        db.from('listings').select('*').eq('user_id', id).order('created_at', { ascending: false }),
+        db.from('tutoring_listings').select('*').eq('tutor_id', id).order('created_at', { ascending: false }),
+        db.from('events').select('*').eq('organiser_id', id).order('date_time', { ascending: false }),
+        db.from('societies').select('*').eq('admin_user_id', id),
+        db.from('polls').select('*').eq('created_by', id).order('created_at', { ascending: false }),
+        db.from('event_rsvps').select('event_id,rsvp_status').eq('user_id', id).neq('rsvp_status', 'Not_Attending'),
+        db.from('society_members').select('society_id').eq('user_id', id)
+    ]);
+    for (const r of [listings, tutoring, events, societies, polls, rsvps, memberships]) if (r.error) throw dbError(r.error);
+    const eventIds = (rsvps.data || []).map(r => r.event_id), socIds = (memberships.data || []).map(m => m.society_id);
+    const [goingEvents, joinedSocieties] = await Promise.all([
+        eventIds.length ? db.from('events').select('event_id,title,date_time,location').in('event_id', eventIds).order('date_time') : { data: [] },
+        socIds.length ? db.from('societies').select('society_id,name').in('society_id', socIds) : { data: [] }
+    ]);
+    const status = new Map((rsvps.data || []).map(r => [r.event_id, r.rsvp_status]));
+    res.json({
+        listings: (listings.data || []).map(l => ({ ...l, price: Number(l.price) })),
+        tutoring: (tutoring.data || []).map(t => ({ ...t, rate: Number(t.rate) })),
+        events: events.data || [], societies: societies.data || [], polls: polls.data || [],
+        going: (goingEvents.data || []).map(e => ({ ...e, my_rsvp: status.get(e.event_id) })),
+        joined_societies: (joinedSocieties.data || []).filter(s => !(societies.data || []).some(a => a.society_id === s.society_id))
+    });
+}));
+
+// -----------------------------------------------------------------------------
+// Messaging (reads use the caller's RLS-scoped client; writes use service role
+// only after explicit participant checks)
+// -----------------------------------------------------------------------------
+const MESSAGE_MAX = 1000;
+const CONTEXT_SOURCES = {
+    listing: { table: 'listings', idCol: 'listing_id', ownerCol: 'user_id', titleCol: 'title' },
+    tutoring: { table: 'tutoring_listings', idCol: 'tutoring_id', ownerCol: 'tutor_id', titleCol: 'subject' },
+    event: { table: 'events', idCol: 'event_id', ownerCol: 'organiser_id', titleCol: 'title' }
+};
+
+async function notifyMessage(conv, sender, body) {
+    const recipient = conv.user_a === sender.id ? conv.user_b : conv.user_a;
+    await notifyUsers([{ user_id: recipient, type: 'Message', message: `${sender.name}: ${body}`.slice(0, 200), related_conversation_id: conv.conversation_id }]);
+}
+
+// Start (or continue) a conversation and send the first message.
+app.post('/conversations', authenticateToken, rateLimit(60, 15 * 60 * 1000), asyncHandler(async (req, res) => {
+    const body = str(req.body.body);
+    if (!body || body.length > MESSAGE_MAX) return res.status(400).json({ error: `Message must be 1-${MESSAGE_MAX} characters` });
+    const type = req.body.context_type || 'direct';
+    let recipient, contextId = null, title = null;
+    if (type === 'direct') {
+        recipient = str(req.body.recipient_id);
+        const p = recipient ? await getProfile(adminClient, recipient).catch(() => null) : null;
+        if (!p || !p.is_active) return res.status(404).json({ error: 'User not found' });
+    } else if (CONTEXT_SOURCES[type]) {
+        const src = CONTEXT_SOURCES[type];
+        contextId = str(req.body.context_id);
+        const { data, error } = await adminClient.from(src.table).select(`${src.ownerCol},${src.titleCol}`).eq(src.idCol, contextId).maybeSingle();
+        if (error) throw dbError(error);
+        if (!data) return res.status(404).json({ error: 'That post no longer exists' });
+        recipient = data[src.ownerCol]; title = data[src.titleCol];
+    } else return res.status(400).json({ error: 'Invalid conversation type' });
+    if (recipient === req.user.id) return res.status(400).json({ error: "You can't message yourself" });
+
+    const [user_a, user_b] = [req.user.id, recipient].sort();
+    const find = () => {
+        let q = adminClient.from('conversations').select('*').eq('user_a', user_a).eq('user_b', user_b).eq('context_type', type);
+        q = contextId ? q.eq('context_id', contextId) : q.is('context_id', null);
+        return q.maybeSingle();
+    };
+    let { data: conv, error } = await find();
+    if (error) throw dbError(error);
+    if (!conv) {
+        ({ data: conv, error } = await adminClient.from('conversations').insert({ user_a, user_b, context_type: type, context_id: contextId, context_title: title }).select('*').single());
+        if (error?.code === '23505') ({ data: conv, error } = await find());
+        if (error) throw dbError(error);
+    }
+    const { error: msgError } = await adminClient.from('messages').insert({ conversation_id: conv.conversation_id, sender_id: req.user.id, body });
+    if (msgError) throw dbError(msgError);
+    await adminClient.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('conversation_id', conv.conversation_id);
+    await notifyMessage(conv, req.user, body);
+    res.status(201).json({ message: 'Message sent', conversation_id: conv.conversation_id });
+}));
+
+app.get('/conversations', authenticateToken, asyncHandler(async (req, res) => {
+    const db = req.user.db, me = req.user.id;
+    const { data: convs, error } = await db.from('conversations').select('*').or(`user_a.eq.${me},user_b.eq.${me}`).order('last_message_at', { ascending: false }).limit(100);
+    if (error) throw dbError(error);
+    const rows = convs || [];
+    const ids = rows.map(c => c.conversation_id);
+    let msgs = [];
+    if (ids.length) {
+        const { data, error: mErr } = await db.from('messages').select('conversation_id,sender_id,body,read_at,created_at').in('conversation_id', ids).order('created_at', { ascending: false }).limit(2000);
+        if (mErr) throw dbError(mErr);
+        msgs = data || [];
+    }
+    const last = new Map(), unread = new Map();
+    for (const m of msgs) {
+        if (!last.has(m.conversation_id)) last.set(m.conversation_id, m);
+        if (!m.read_at && m.sender_id !== me) unread.set(m.conversation_id, (unread.get(m.conversation_id) || 0) + 1);
+    }
+    const profiles = await profileMap(db, rows.map(c => (c.user_a === me ? c.user_b : c.user_a)));
+    const conversations = rows.map(c => {
+        const otherId = c.user_a === me ? c.user_b : c.user_a;
+        const l = last.get(c.conversation_id);
+        return { conversation_id: c.conversation_id, other_user_id: otherId, other_name: profiles.get(otherId)?.name || 'Unknown', context_type: c.context_type, context_title: c.context_title,
+            last_message: l ? { body: l.body, mine: l.sender_id === me, created_at: l.created_at } : null, unread: unread.get(c.conversation_id) || 0, last_message_at: c.last_message_at };
+    });
+    res.json({ conversations, unread_total: conversations.reduce((a, c) => a + c.unread, 0) });
+}));
+
+app.get('/conversations/:id/messages', authenticateToken, asyncHandler(async (req, res) => {
+    const { data: conv, error } = await req.user.db.from('conversations').select('*').eq('conversation_id', req.params.id).maybeSingle();
+    if (error) throw dbError(error);
+    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+    const { data: messages, error: mErr } = await req.user.db.from('messages').select('message_id,sender_id,body,read_at,created_at').eq('conversation_id', conv.conversation_id).order('created_at', { ascending: true }).limit(500);
+    if (mErr) throw dbError(mErr);
+    // Opening a thread marks the other person's messages and related notifications as read.
+    await adminClient.from('messages').update({ read_at: new Date().toISOString() }).eq('conversation_id', conv.conversation_id).neq('sender_id', req.user.id).is('read_at', null);
+    await adminClient.from('notifications').update({ is_read: true }).eq('user_id', req.user.id).eq('related_conversation_id', conv.conversation_id).eq('is_read', false);
+    const otherId = conv.user_a === req.user.id ? conv.user_b : conv.user_a;
+    const profiles = await profileMap(req.user.db, [otherId]);
+    res.json({
+        conversation: { conversation_id: conv.conversation_id, context_type: conv.context_type, context_id: conv.context_id, context_title: conv.context_title, other_user_id: otherId, other_name: profiles.get(otherId)?.name || 'Unknown' },
+        messages: (messages || []).map(m => ({ ...m, mine: m.sender_id === req.user.id }))
+    });
+}));
+
+app.post('/conversations/:id/messages', authenticateToken, rateLimit(120, 15 * 60 * 1000), asyncHandler(async (req, res) => {
+    const body = str(req.body.body);
+    if (!body || body.length > MESSAGE_MAX) return res.status(400).json({ error: `Message must be 1-${MESSAGE_MAX} characters` });
+    const { data: conv, error } = await req.user.db.from('conversations').select('*').eq('conversation_id', req.params.id).maybeSingle();
+    if (error) throw dbError(error);
+    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+    const { data, error: msgError } = await adminClient.from('messages').insert({ conversation_id: conv.conversation_id, sender_id: req.user.id, body }).select('message_id,created_at').single();
+    if (msgError) throw dbError(msgError);
+    await adminClient.from('conversations').update({ last_message_at: data.created_at }).eq('conversation_id', conv.conversation_id);
+    await notifyMessage(conv, req.user, body);
+    res.status(201).json({ message: 'Message sent', message_id: data.message_id });
 }));
 
 // -----------------------------------------------------------------------------
