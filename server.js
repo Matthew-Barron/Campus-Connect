@@ -17,6 +17,9 @@ import { fileURLToPath } from 'url';
 dotenv.config();
 
 const app = express();
+// Render (and most hosts) sit behind a reverse proxy. Without this every visitor shares the proxy's IP,
+// so the rate limits below would be shared by ALL users.
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT) || 5000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/rest\/v1\/?$/, '');
@@ -32,6 +35,11 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 const publicClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+});
+// Sign-in / sign-up must use a throw-away client. A shared client keeps the last user's session in memory,
+// which leaks that identity into later queries and can rotate the browser's refresh token (logging users out).
+const freshAuthClient = () => createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
 });
 const adminClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -60,7 +68,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const rateBuckets = new Map();
 const rateLimit = (max, windowMs) => (req, res, next) => {
-    const key = `${req.ip}:${req.path}`;
+    const key = `${req.user?.id || req.ip}:${req.baseUrl}${req.route?.path || req.path}`;
     const now = Date.now();
     const bucket = (rateBuckets.get(key) || []).filter(t => now - t < windowMs);
     if (bucket.length >= max) return res.status(429).json({ error: 'Too many attempts. Please try again later.' });
@@ -115,10 +123,25 @@ function userClient(token) {
     });
 }
 
+const unavailable = (msg = 'Service temporarily unavailable. Please try again.') => { const e = new Error(msg); e.status = 503; return e; };
+const userCache = new Map(); // token -> { user, expires }
+const USER_CACHE_MS = 20 * 1000;
+setInterval(() => { const now = Date.now(); for (const [k, v] of userCache) if (v.expires < now) userCache.delete(k); }, 60 * 1000).unref();
+
+// Returns the user for a valid token, null for an invalid/expired token or inactive account,
+// and THROWS a 503 when Supabase is only temporarily unreachable (so the browser doesn't log the user out).
 async function loadUser(token) {
+    const cached = userCache.get(token);
+    if (cached && cached.expires > Date.now()) return cached.user;
+
     const { data, error } = await publicClient.auth.getUser(token);
+    if (error) {
+        const transient = error.name === 'AuthRetryableFetchError' || !error.status || error.status >= 500 || error.status === 429;
+        if (transient) throw unavailable();
+        return null;
+    }
     const user = data?.user;
-    if (error || !user) return null;
+    if (!user) return null;
 
     const db = userClient(token);
     const { data: profile, error: profileError } = await db
@@ -126,9 +149,10 @@ async function loadUser(token) {
         .select('id,name,email,role,is_active')
         .eq('id', user.id)
         .maybeSingle();
-    if (profileError || !profile || !profile.is_active) return null;
+    if (profileError) throw unavailable();
+    if (!profile || !profile.is_active) return null;
 
-    return {
+    const result = {
         id: user.id,
         user_id: user.id, // Keep the existing API contract while moving to UUIDs.
         email: user.email,
@@ -138,6 +162,9 @@ async function loadUser(token) {
         token,
         db
     };
+    if (userCache.size > 500) userCache.clear();
+    userCache.set(token, { user: result, expires: Date.now() + USER_CACHE_MS });
+    return result;
 }
 
 const authenticateToken = asyncHandler(async (req, res, next) => {
@@ -206,7 +233,7 @@ app.post('/auth/register', rateLimit(10, 15 * 60 * 1000), asyncHandler(async (re
     if (studentError) throw dbError(studentError);
     if (existingStudent?.length) return res.status(409).json({ error: 'Email or student number already registered' });
 
-    const { data, error } = await publicClient.auth.signUp({
+    const { data, error } = await freshAuthClient().auth.signUp({
         email,
         password,
         options: { data: { name, student_number } }
@@ -248,7 +275,7 @@ app.post('/auth/login', rateLimit(20, 15 * 60 * 1000), asyncHandler(async (req, 
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     if (!CAMPUS_EMAIL_REGEX.test(email)) return res.status(400).json({ error: 'Use your CPUT student email address ending in @mycput.ac.za' });
 
-    const { data, error } = await publicClient.auth.signInWithPassword({ email, password });
+    const { data, error } = await freshAuthClient().auth.signInWithPassword({ email, password });
     if (error || !data.session || !data.user) return res.status(401).json({ error: 'Invalid credentials' });
 
     const profile = await getProfile(adminClient, data.user.id);
@@ -274,7 +301,7 @@ app.post('/auth/forgot-password', rateLimit(5, 15 * 60 * 1000), asyncHandler(asy
 
     if (profiles?.length) {
         const redirectTo = process.env.PASSWORD_RESET_REDIRECT_URL || `${process.env.FRONTEND_URL || `http://localhost:${PORT}`}/`;
-        const { error } = await publicClient.auth.resetPasswordForEmail(email, { redirectTo });
+        const { error } = await freshAuthClient().auth.resetPasswordForEmail(email, { redirectTo });
         if (error) console.error('Password reset request failed:', error.message);
     }
 

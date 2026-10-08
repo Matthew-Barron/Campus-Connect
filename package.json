@@ -21,6 +21,9 @@
   ],
   "author": "Matthew",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.58.0",
     "cors": "^2.8.5",

@@ -37,7 +37,7 @@ function ago(d) {
     return fmtDate(d);
 }
 
-async function api(endpoint, method = 'GET', body = null) {
+async function api(endpoint, method = 'GET', body = null, retried = false) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (supabaseClient) {
         const { data } = await supabaseClient.auth.getSession();
@@ -55,9 +55,19 @@ async function api(endpoint, method = 'GET', body = null) {
     let data = {};
     try { data = await res.json(); } catch { /* non-JSON response */ }
     if (res.status === 401 && token) {
+        // The token may simply have expired while the tab was idle: refresh it and retry once before giving up.
+        if (!retried && supabaseClient) {
+            const { data: refreshed, error } = await supabaseClient.auth.refreshSession();
+            if (refreshed?.session) return api(endpoint, method, body, true);
+            // A network problem during refresh must not log the user out (or close an open form).
+            if (error && !/invalid|expired|not found|revoked|already used/i.test(error.message || '')) {
+                throw new Error("Can't reach the server. Check your connection and try again.");
+            }
+        }
         endSession();
         throw new Error(data.error || 'Session expired. Please log in again.');
     }
+    if (res.status === 503) throw new Error(data.error || 'Service temporarily unavailable. Please try again.');
     if (!res.ok) throw new Error(data.error || 'Something went wrong');
     return data;
 }
@@ -79,19 +89,27 @@ async function withBusy(btn, fn) {
 }
 
 // ===== MODAL =====
+let modalDirty = false;
 function openModal(title, html) {
     lastFocus = document.activeElement;
     $('#modal-body').innerHTML = `<h2 id="modal-title">${esc(title)}</h2>${html}`;
+    modalDirty = false;
     $('#modal-overlay').classList.remove('hidden');
     document.body.style.overflow = 'hidden';
-    const first = $('#modal-body input, #modal-body textarea, #modal-body select, #modal-body button');
+    const first = $('#modal-body input:not([type=hidden]), #modal-body textarea, #modal-body select, #modal-body button');
     (first || $('#modal-close')).focus();
 }
 function closeModal() {
     $('#modal-overlay').classList.add('hidden');
     $('#modal-body').innerHTML = '';
     document.body.style.overflow = '';
+    modalDirty = false;
     if (lastFocus && lastFocus.isConnected) lastFocus.focus();
+}
+// User-initiated close (Esc, backdrop, X, Cancel): ask first if they have typed something, so work isn't lost by accident.
+function requestCloseModal() {
+    if (modalDirty && !confirm('Discard your changes?')) return;
+    closeModal();
 }
 function formError(form, msg) {
     let el = $('.form-error', form);
@@ -100,11 +118,15 @@ function formError(form, msg) {
 }
 
 // ===== SESSION =====
+let ending = false;
 async function endSession() {
-    token = null; currentUser = null; seenNotifs = null; activeThread = null;
+    if (ending) return;
+    ending = true;
+    token = null; currentUser = null; seenNotifs = null; activeThread = null; notifications = []; store.clear();
     if (supabaseClient) await supabaseClient.auth.signOut().catch(() => {});
     closeModal();
     renderRoute();
+    ending = false;
 }
 
 async function startSession(result) {
@@ -175,7 +197,7 @@ function renderAuth(tab = 'login') {
         </form>`}
     </div>`;
     const first = $('input', view);
-    if (first && !matchMedia('(pointer: coarse)').matches) first.focus();
+    if (first && !matchMedia('(pointer: coarse)').matches && $('#modal-overlay').classList.contains('hidden')) first.focus();
 }
 
 function validatePassword(pw) {
@@ -211,6 +233,7 @@ const forms = {
     async reset(form, d) {
         const pwErr = validatePassword(d.new_password);
         if (pwErr) return formError(form, pwErr);
+        if (d.new_password !== d.confirm_password) return formError(form, 'The two passwords do not match');
         if (!supabaseClient) return formError(form, 'Authentication is still loading. Please try again.');
         const { error } = await supabaseClient.auth.updateUser({ password: d.new_password });
         if (error) throw error;
@@ -273,7 +296,7 @@ const forms = {
 
 function openForgotForm() {
     openModal('Reset your password', `
-    <p class="meta" style="margin-bottom:1rem">Enter your campus email and student number. Supabase Auth will send a secure password reset email.</p>
+    <p class="meta" style="margin-bottom:1rem">Enter your campus email and student number and we'll email you a secure link to reset your password.</p>
     <form data-form="forgot" novalidate>
         <div class="form-group"><label for="f-email">Campus email</label><input type="email" id="f-email" name="email" required></div>
         <div class="form-group"><label for="f-student">Student number</label><input type="text" id="f-student" name="student_number" required></div>
@@ -282,10 +305,11 @@ function openForgotForm() {
 }
 function openResetForm() {
     openModal('Choose a new password', `
-    <p class="meta" style="margin-bottom:1rem">Your Supabase recovery session is active. Choose a new password below.</p>
+    <p class="meta" style="margin-bottom:1rem">Choose a new password for your account below.</p>
     <form data-form="reset" novalidate>
         <div class="form-group"><label for="r-pw">New password</label><input type="password" id="r-pw" name="new_password" autocomplete="new-password" required>
             <div class="hint">At least 8 characters, with a letter and a number</div></div>
+        <div class="form-group"><label for="r-pw2">Confirm new password</label><input type="password" id="r-pw2" name="confirm_password" autocomplete="new-password" required></div>
         <div class="modal-actions"><button type="button" class="btn btn-secondary" data-action="close-modal">Cancel</button><button class="btn" type="submit">Reset password</button></div>
     </form>`);
 }
@@ -372,7 +396,7 @@ async function loadEvents() {
                 <div style="flex:1"><h3>${esc(e.title)}</h3><p class="meta">🕒 ${fmtDateTime(e.date_time)}</p></div></div>
             ${e.location ? `<p class="meta">📍 ${esc(e.location)}</p>` : ''}
             ${e.description ? `<p class="desc">${esc(e.description)}</p>` : ''}
-            <p class="meta">Organised by ${who(e.organiser_id, e.organiser_name)} · ${plural(e.attending_count, 'person')} going · ${e.interested_count} interested</p>
+            <p class="meta">Organised by ${who(e.organiser_id, e.organiser_name)} · ${e.attending_count} going · ${e.interested_count} interested</p>
             <div class="actions">
                 <button class="btn btn-sm ${e.my_rsvp === 'Attending' ? '' : 'btn-secondary'}" data-action="rsvp" data-id="${e.event_id}" data-status="${e.my_rsvp === 'Attending' ? 'Not_Attending' : 'Attending'}" aria-pressed="${e.my_rsvp === 'Attending'}">${e.my_rsvp === 'Attending' ? '✓ Going' : 'Going'}</button>
                 <button class="btn btn-sm ${e.my_rsvp === 'Interested' ? '' : 'btn-secondary'}" data-action="rsvp" data-id="${e.event_id}" data-status="${e.my_rsvp === 'Interested' ? 'Not_Attending' : 'Interested'}" aria-pressed="${e.my_rsvp === 'Interested'}">${e.my_rsvp === 'Interested' ? '★ Interested' : 'Interested'}</button>
@@ -638,8 +662,8 @@ async function findRecord(kind, id) {
 async function openEditForm(kind, id) {
     const r = await findRecord(kind, id);
     if (!r) return toast(`Couldn't load that ${kind} to edit (id: ${id || 'missing'}). It may have been deleted - refresh the page.`, 'error');
-    const f = (label, name, val, extra = '') => `<div class="form-group"><label>${label}<input name="${name}" value="${esc(val ?? '')}" ${extra}></label></div>`;
-    const ta = (val) => `<div class="form-group"><label>Description<textarea name="description">${esc(val || '')}</textarea></label></div>`;
+    const f = (label, name, val, extra = '') => `<div class="form-group"><label for="ed-${name}">${label}</label><input id="ed-${name}" name="${name}" value="${esc(val ?? '')}" ${extra}></div>`;
+    const ta = (val) => `<div class="form-group"><label for="ed-description">Description</label><textarea id="ed-description" name="description">${esc(val || '')}</textarea></div>`;
     const body = ({
         listing: () => f('Title', 'title', r.title, 'maxlength="150" required') + ta(r.description) + f('Price (R)', 'price', r.price, 'type="number" min="0.01" step="0.01" required'),
         event: () => f('Title', 'title', r.title, 'maxlength="150" required') + f('Date &amp; time', 'date_time', toLocalInput(r.date_time), 'type="datetime-local" required') + f('Location', 'location', r.location, 'maxlength="200"') + ta(r.description),
@@ -706,7 +730,7 @@ const actions = {
     'auth-tab': (el) => renderAuth(el.dataset.tab),
     'toggle-pw': (el) => { const i = el.previousElementSibling; const show = i.type === 'password'; i.type = show ? 'text' : 'password'; el.textContent = show ? 'Hide' : 'Show'; },
     'forgot': openForgotForm,
-    'close-modal': closeModal,
+    'close-modal': requestCloseModal,
     'reload': renderRoute,
     'new-listing': newListingForm,
     'new-event': newEventForm,
@@ -765,24 +789,31 @@ const actions = {
     'logout': () => { endSession(); toast('Logged out', 'info'); }
 };
 
+// A click only counts as a backdrop click if the press STARTED on the backdrop. Otherwise selecting text in a
+// form field and releasing the mouse outside the dialog would close it and throw away the edits.
+let overlayPressed = false;
+document.addEventListener('mousedown', (e) => { overlayPressed = e.target.id === 'modal-overlay'; });
+document.addEventListener('touchstart', (e) => { overlayPressed = e.target.id === 'modal-overlay'; }, { passive: true });
+
 document.addEventListener('click', async (e) => {
     const el = e.target.closest('[data-action]');
     if (!el) {
         if (!e.target.closest('.bell-wrap')) toggleNotifPanel(false);
-        if (e.target.id === 'modal-overlay') closeModal();
+        if (e.target.id === 'modal-overlay' && overlayPressed) requestCloseModal();
         return;
     }
+    if (!e.target.closest('.bell-wrap')) toggleNotifPanel(false);
     const fn = actions[el.dataset.action];
     if (!fn) return;
     try { await fn(el); } catch (ex) { toast(ex.message, 'error'); }
 });
 $('#bell').addEventListener('click', () => toggleNotifPanel());
 $('#logout-btn').addEventListener('click', actions.logout);
-$('#modal-close').addEventListener('click', closeModal);
+$('#modal-close').addEventListener('click', requestCloseModal);
 
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-        if (!$('#modal-overlay').classList.contains('hidden')) closeModal();
+        if (!$('#modal-overlay').classList.contains('hidden')) requestCloseModal();
         else toggleNotifPanel(false);
     }
     // keep keyboard focus inside the modal
@@ -799,7 +830,8 @@ let debounce;
 document.addEventListener('input', (e) => {
     const t = e.target;
     if (t.getAttribute('aria-invalid')) t.removeAttribute('aria-invalid');
-    if (t.dataset.count) $(t.dataset.count).textContent = `${t.value.length} / ${t.maxLength}`;
+    if (t.closest('#modal')) modalDirty = true;
+    if (t.dataset.count && $(t.dataset.count)) $(t.dataset.count).textContent = `${t.value.length} / ${t.maxLength}`;
     if (t.id === 'mk-search') { clearTimeout(debounce); debounce = setTimeout(() => { mk.search = t.value.trim(); fetchListings(); }, 300); }
     if (t.id === 'tu-filter') { clearTimeout(debounce); debounce = setTimeout(() => { tutorFilter = t.value.trim(); fetchTutoring(); }, 300); }
 });
@@ -813,6 +845,13 @@ setInterval(() => { if (currentUser && !document.hidden && activeThread) refresh
 document.addEventListener('visibilitychange', () => { if (currentUser && !document.hidden) loadNotifications(); });
 
 // ===== INIT =====
+// Capture recovery info from the URL before Supabase strips it.
+const urlHash = new URLSearchParams(location.hash.replace(/^#/, ''));
+const urlQuery = new URLSearchParams(location.search);
+const linkError = urlHash.get('error_description') || urlQuery.get('error_description');
+const isRecoveryLink = urlHash.get('type') === 'recovery';
+let resetFormShown = false;
+function showResetOnce() { if (resetFormShown) return; resetFormShown = true; setTimeout(openResetForm, 0); }
 // Render a usable screen immediately. Authentication/configuration is asynchronous,
 // so a slow backend or Supabase connection must never leave the page blank.
 renderAuth('login');
@@ -843,9 +882,7 @@ async function fetchConfig() {
 
         supabaseClient.auth.onAuthStateChange((event, session) => {
             token = session?.access_token || null;
-            if (event === 'PASSWORD_RECOVERY') {
-                setTimeout(() => openResetForm(), 0);
-            }
+            if (event === 'PASSWORD_RECOVERY') showResetOnce();
         });
 
         const { data } = await supabaseClient.auth.getSession();
@@ -860,4 +897,9 @@ async function fetchConfig() {
         toast(e.message || 'Authentication could not be initialized.', 'error');
     }
     renderRoute();
+    if (isRecoveryLink && supabaseClient && token) showResetOnce();
+    if (linkError) {
+        history.replaceState(null, '', location.pathname);
+        toast(/expired|invalid/i.test(linkError) ? 'That reset link is invalid or has expired. Please request a new one.' : linkError.replace(/\+/g, ' '), 'error');
+    }
 })();
